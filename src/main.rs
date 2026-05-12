@@ -23,7 +23,7 @@ fn sample_next(
 fn main() -> std::io::Result<()> {
     let mut counts: HashMap<[char; WINDOW_LENGTH], Vec<(char, u32)>> = HashMap::new();
     {
-        let content: String = fs::read_to_string("data/enwik8.txt")?;
+        let content: String = fs::read_to_string("data/shakespeare_full.txt")?;
         let mut chars_iter = content.trim().chars();
         let mut window: [char; WINDOW_LENGTH] = [' '; WINDOW_LENGTH];
         for slot in window.iter_mut() {
