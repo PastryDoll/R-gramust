@@ -9,45 +9,45 @@ use std::time::Instant;
 
 const MAX_WINDOW: usize = 5;
 
-fn get_shard(window: &str, num_shards: usize) -> usize {
+fn get_shard(key: &[char], num_shards: usize) -> usize {
     let mut hasher = FxHasher::default();
-    window.hash(&mut hasher);
+    key.hash(&mut hasher);
     (hasher.finish() % num_shards as u64) as usize
 }
 
 fn sample_next(
     window: &[char],
-    shards: &[FxHashMap<String, Vec<(char, f64)>>],
+    shards: &[FxHashMap<&[char], Vec<(char, u32)>>],
     rng: &mut impl Rng,
 ) -> Option<char> {
     // Try progressively shorter windows
     for size in (1..=window.len()).rev() {
-        let key: String = window[window.len() - size..].iter().collect();
-        let shard = &shards[get_shard(&key, shards.len())];
-        if let Some(nexts) = shard.get(&key) {
-            let roll: f64 = rng.random();
-            let mut cumulative = 0.0;
-            for &(ch, prob) in nexts {
-                cumulative += prob;
-                if roll < cumulative {
+        let key: &[char] = &window[window.len() - size..];
+        let shard = &shards[get_shard(key, shards.len())];
+        if let Some(nexts) = shard.get(key) {
+            let total: u32 = nexts.iter().map(|(_, c)| *c).sum();
+            let mut roll: u32 = rng.random_range(0..total);
+            for &(ch, count) in nexts {
+                if roll < count {
                     return Some(ch);
                 }
+                roll -= count
             }
         } else {
-            eprintln!("Window {key} dont exist in vocabulary");
+            eprintln!("Window {:?} dont exist in vocabulary", key);
         }
     }
     None
 }
 
 /// Scans chars[start..end], return build N shards with counts.
-fn count_chunk(
-    chars: &[char],
+fn count_chunk<'a>(
+    chars: &'a [char],
     start: usize,
     end: usize,
     num_shards: usize,
-) -> Vec<FxHashMap<String, Vec<(char, u32)>>> {
-    let mut shards: Vec<FxHashMap<String, Vec<(char, u32)>>> =
+) -> Vec<FxHashMap<&'a [char], Vec<(char, u32)>>> {
+    let mut shards: Vec<FxHashMap<&'a [char], Vec<(char, u32)>>> =
         (0..num_shards).map(|_| FxHashMap::default()).collect();
 
     for i in start..end {
@@ -56,8 +56,9 @@ fn count_chunk(
             if i < size {
                 continue;
             }
-            let window: String = chars[i - size..i].iter().collect();
-            let s = get_shard(&window, shards.len());
+            let window: &'a [char] = &chars[i - size..i];
+
+            let s = get_shard(window, shards.len());
             let entry = shards[s].entry(window).or_default();
             if let Some(slot) = entry.iter_mut().find(|(c, _)| *c == next_char) {
                 slot.1 += 1;
@@ -69,10 +70,10 @@ fn count_chunk(
     shards
 }
 
-fn merge_shards(
-    submaps: Vec<FxHashMap<String, Vec<(char, u32)>>>,
-) -> FxHashMap<String, Vec<(char, u32)>> {
-    let mut merged: FxHashMap<String, Vec<(char, u32)>> = FxHashMap::default();
+fn merge_shards<'a>(
+    submaps: Vec<FxHashMap<&'a [char], Vec<(char, u32)>>>,
+) -> FxHashMap<&'a [char], Vec<(char, u32)>> {
+    let mut merged: FxHashMap<&'a [char], Vec<(char, u32)>> = FxHashMap::default();
     for submap in submaps {
         for (window, nexts) in submap {
             let entry = merged.entry(window).or_default();
@@ -89,10 +90,14 @@ fn merge_shards(
 }
 
 fn main() -> std::io::Result<()> {
-    let file_name = "shakespeare_full.txt";
+    let file_name = "enwik8.txt";
     println!("Generating index for {file_name}");
-    let content: String = fs::read_to_string(format!("data/{file_name}"))?;
-    let chars: Vec<char> = content.trim().chars().collect();
+    let tfile = Instant::now();
+    let chars: Vec<char> = {
+        let content = fs::read_to_string(format!("data/{file_name}"))?;
+        content.trim().chars().collect()
+    };
+    eprintln!("read phase: {:?}", tfile.elapsed());
     let n = chars.len();
 
     let num_threads = thread::available_parallelism()
@@ -104,8 +109,8 @@ fn main() -> std::io::Result<()> {
     println!("Using {num_threads} threads / {num_shards} shards to index");
 
     let t0 = Instant::now();
-    // counts = vec of shards each shards is disjoint in the space of keys
-    let counts: Vec<FxHashMap<String, Vec<(char, u32)>>> = thread::scope(|scope| {
+    // counts = vec of shards each shards is disjoint in the space of keys.
+    let counts: Vec<FxHashMap<&[char], Vec<(char, u32)>>> = thread::scope(|scope| {
         // Count into each shard
         let mut count_handles = Vec::new();
         for t in 0..num_threads {
@@ -116,17 +121,15 @@ fn main() -> std::io::Result<()> {
         }
 
         // grid = each row is a vec of shards
-        let grid: Vec<Vec<FxHashMap<String, Vec<(char, u32)>>>> = count_handles
+        let grid: Vec<Vec<FxHashMap<&[char], Vec<(char, u32)>>>> = count_handles
             .into_iter()
             .map(|h| h.join().unwrap())
             .collect();
         eprintln!("count phase: {:?}", t0.elapsed());
 
-        // transpose so each column corresponds to a shard_id
-        // we need to move the pointers instead fo ref bc the assembling step
-        // modifies the data
+        // transpose so each column corresponds to a shard_id.
         let t1 = Instant::now();
-        let mut columns: Vec<Vec<FxHashMap<String, Vec<(char, u32)>>>> =
+        let mut columns: Vec<Vec<FxHashMap<&[char], Vec<(char, u32)>>>> =
             (0..num_shards).map(|_| Vec::new()).collect();
         for row in grid {
             for (k, submap) in row.into_iter().enumerate() {
@@ -134,12 +137,12 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // Merge each shared of same id
+        // Merge each shard's column independently — disjoint keyspaces.
         let mut merge_handles = Vec::new();
         for column in columns {
             merge_handles.push(scope.spawn(move || merge_shards(column)));
         }
-        let shard_maps: Vec<FxHashMap<String, Vec<(char, u32)>>> = merge_handles
+        let shard_maps: Vec<FxHashMap<&[char], Vec<(char, u32)>>> = merge_handles
             .into_iter()
             .map(|h| h.join().unwrap())
             .collect();
@@ -148,31 +151,14 @@ fn main() -> std::io::Result<()> {
         shard_maps
     });
 
-    // Convert counts -> probabilities, shard by shard.
-    let prob_shards: Vec<FxHashMap<String, Vec<(char, f64)>>> = counts
-        .into_iter()
-        .map(|shard| {
-            shard
-                .into_iter()
-                .map(|(window, nexts)| {
-                    let total: u32 = nexts.iter().map(|(_, c)| *c).sum();
-                    let probs: Vec<(char, f64)> = nexts
-                        .into_iter()
-                        .map(|(ch, count)| (ch, count as f64 / total as f64))
-                        .collect();
-                    (window, probs)
-                })
-                .collect()
-        })
-        .collect();
     println!("Indexing done!");
-
     // generate text
     print!("Enter some text that will be autocompleted: ");
     // io::stdout().flush()?;
     // let mut input = String::new();
     // io::stdin().read_line(&mut input)?;
     // let input = input.trim();
+    let t2 = Instant::now();
     let input = String::from("There");
     let input_chars: Vec<char> = input.chars().collect();
     let take = input_chars.len().min(MAX_WINDOW);
@@ -180,9 +166,9 @@ fn main() -> std::io::Result<()> {
 
     let mut window: Vec<char> = Vec::new();
     for size in (1..=tail.len()).rev() {
-        let candidate: String = tail[tail.len() - size..].iter().collect();
-        if prob_shards[get_shard(&candidate, prob_shards.len())].contains_key(&candidate) {
-            window = tail[tail.len() - size..].to_vec();
+        let candidate: &[char] = &tail[tail.len() - size..];
+        if counts[get_shard(candidate, counts.len())].contains_key(candidate) {
+            window = candidate.to_vec();
             break;
         }
     }
@@ -201,8 +187,8 @@ fn main() -> std::io::Result<()> {
     print!("|");
 
     let mut rng = rand::rng();
-    for _ in 0..5500 {
-        if let Some(next) = sample_next(&window, &prob_shards, &mut rng) {
+    for _ in 0..500 {
+        if let Some(next) = sample_next(&window, &counts, &mut rng) {
             print!("{next}");
             // io::stdout().flush().unwrap();
             // // Sleep to give the impression of thinking! - Caio
@@ -215,6 +201,7 @@ fn main() -> std::io::Result<()> {
             break;
         }
     }
+    eprintln!("gen phase: {:?}", t2.elapsed());
     println!();
     Ok(())
 }
