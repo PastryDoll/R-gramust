@@ -158,9 +158,13 @@ pub fn bpe(file_path: &Path, num_merges: usize) -> std::io::Result<BpeModel> {
 
     for i in 0..num_merges {
         let t = Instant::now();
-        let Some((pair, _freq)) = most_frequent_u16(&counts) else {
+        let Some((pair, freq)) = most_frequent_u16(&counts) else {
             break;
         };
+        // This should never happen
+        if freq == 0 {
+            break;
+        }
         time_most_freq += t.elapsed();
 
         let new_token = 256 + i as u16;
